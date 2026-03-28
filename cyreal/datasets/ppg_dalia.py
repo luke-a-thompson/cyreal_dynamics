@@ -73,7 +73,7 @@ def _as_column(array: np.ndarray) -> np.ndarray:
 
 
 def _subject_member_name(subject_id: int) -> str:
-    return f"data/PPG_FieldStudy/S{subject_id}/S{subject_id}.pkl"
+    return f"PPG_FieldStudy/S{subject_id}/S{subject_id}.pkl"
 
 
 def _find_inner_archive_member(outer_archive_path: Path) -> str:
