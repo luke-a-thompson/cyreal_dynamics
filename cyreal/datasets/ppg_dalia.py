@@ -35,6 +35,25 @@ _INPUT_WINDOW_STEP = 4_992
 _OUTPUT_WINDOW_SIZE = 390
 _OUTPUT_WINDOW_STEP = 39
 
+_SEGMENT_FRACTIONS: dict[str, tuple[float, float | None]] = {
+    "front70": (0.0, 0.7),
+    "mid15_a": (0.7, 0.85),
+    "tail15": (0.85, None),
+    "center70": (0.15, 0.85),
+    "head15": (0.0, 0.15),
+    "from30": (0.30, None),
+    "mid15_b": (0.15, 0.30),
+}
+
+_VARIANT_SEGMENT_ORDER: dict[int, tuple[str, str, str]] = {
+    0: ("front70", "mid15_a", "tail15"),
+    1: ("front70", "tail15", "mid15_a"),
+    2: ("center70", "head15", "tail15"),
+    3: ("center70", "tail15", "head15"),
+    4: ("from30", "head15", "mid15_b"),
+    5: ("from30", "mid15_b", "head15"),
+}
+
 
 def _normalize_signed(array: np.ndarray) -> np.ndarray:
     array_np = np.asarray(array, dtype=np.float32)
@@ -73,6 +92,23 @@ def _find_inner_archive_member(outer_archive_path: Path) -> str:
     return candidates[0]
 
 
+def _bad_zip_error(
+    *,
+    kind: Literal["outer", "inner"],
+    archive_path: Path,
+    base_dir: Path,
+    exc: zipfile.BadZipFile,
+    local_files_only: bool | None = None,
+) -> zipfile.BadZipFile:
+    base_msg = (
+        f"Invalid PPG-DaLiA {kind} archive at '{archive_path.resolve()}' "
+        f"(cache_dir resolved to '{base_dir.resolve()}'"
+    )
+    if local_files_only is not None:
+        base_msg += f", local_files_only={local_files_only}"
+    return zipfile.BadZipFile(f"{base_msg}). {exc}")
+
+
 def _ensure_inner_archive(base_dir: Path, *, local_files_only: bool = False) -> Path:
     raw_dir = base_dir / "raw"
     inner_archive_path = raw_dir / "data.zip"
@@ -87,13 +123,22 @@ def _ensure_inner_archive(base_dir: Path, *, local_files_only: bool = False) -> 
                 f"Expected either '{inner_archive_path}' or '{outer_archive_path}'."
             )
         download_archive(PPG_DALIA_URL, outer_archive_path)
-    member_name = _find_inner_archive_member(outer_archive_path)
-    ensure_zip_member_extracted(
-        outer_archive_path,
-        raw_dir,
-        member_name,
-        target_name="data.zip",
-    )
+    try:
+        member_name = _find_inner_archive_member(outer_archive_path)
+        ensure_zip_member_extracted(
+            outer_archive_path,
+            raw_dir,
+            member_name,
+            target_name="data.zip",
+        )
+    except zipfile.BadZipFile as exc:
+        raise _bad_zip_error(
+            kind="outer",
+            archive_path=outer_archive_path,
+            base_dir=base_dir,
+            local_files_only=local_files_only,
+            exc=exc,
+        ) from exc
     if outer_archive_path.exists():
         outer_archive_path.unlink()
     return inner_archive_path
@@ -101,14 +146,22 @@ def _ensure_inner_archive(base_dir: Path, *, local_files_only: bool = False) -> 
 
 def _load_subject_payload(inner_archive_path: Path, subject_id: int) -> dict:
     member_name = _subject_member_name(subject_id)
-    with zipfile.ZipFile(inner_archive_path, "r") as zf:
-        try:
-            with zf.open(member_name, "r") as f:
-                return pickle.load(f, encoding="latin1")
-        except KeyError as exc:
-            raise FileNotFoundError(
-                f"Missing archive member '{member_name}' in '{inner_archive_path}'."
-            ) from exc
+    try:
+        with zipfile.ZipFile(inner_archive_path, "r") as zf:
+            try:
+                with zf.open(member_name, "r") as f:
+                    return pickle.load(f, encoding="latin1")
+            except KeyError as exc:
+                raise FileNotFoundError(
+                    f"Missing archive member '{member_name}' in '{inner_archive_path}'."
+                ) from exc
+    except zipfile.BadZipFile as exc:
+        raise _bad_zip_error(
+            kind="inner",
+            archive_path=inner_archive_path,
+            base_dir=inner_archive_path.parent.parent,
+            exc=exc,
+        ) from exc
 
 
 def _prepare_subject_arrays(subject_payload: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -150,61 +203,25 @@ def _split_subject_variant(
     labels: np.ndarray,
     variant: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    if variant == 0:
-        return (
-            _slice_fraction(inputs, 0.0, 0.7),
-            _slice_fraction(labels, 0.0, 0.7),
-            _slice_fraction(inputs, 0.7, 0.85),
-            _slice_fraction(labels, 0.7, 0.85),
-            _slice_fraction(inputs, 0.85, None),
-            _slice_fraction(labels, 0.85, None),
-        )
-    if variant == 1:
-        return (
-            _slice_fraction(inputs, 0.0, 0.7),
-            _slice_fraction(labels, 0.0, 0.7),
-            _slice_fraction(inputs, 0.85, None),
-            _slice_fraction(labels, 0.85, None),
-            _slice_fraction(inputs, 0.7, 0.85),
-            _slice_fraction(labels, 0.7, 0.85),
-        )
-    if variant == 2:
-        return (
-            _slice_fraction(inputs, 0.15, 0.85),
-            _slice_fraction(labels, 0.15, 0.85),
-            _slice_fraction(inputs, 0.0, 0.15),
-            _slice_fraction(labels, 0.0, 0.15),
-            _slice_fraction(inputs, 0.85, None),
-            _slice_fraction(labels, 0.85, None),
-        )
-    if variant == 3:
-        return (
-            _slice_fraction(inputs, 0.15, 0.85),
-            _slice_fraction(labels, 0.15, 0.85),
-            _slice_fraction(inputs, 0.85, None),
-            _slice_fraction(labels, 0.85, None),
-            _slice_fraction(inputs, 0.0, 0.15),
-            _slice_fraction(labels, 0.0, 0.15),
-        )
-    if variant == 4:
-        return (
-            _slice_fraction(inputs, 0.30, None),
-            _slice_fraction(labels, 0.30, None),
-            _slice_fraction(inputs, 0.0, 0.15),
-            _slice_fraction(labels, 0.0, 0.15),
-            _slice_fraction(inputs, 0.15, 0.30),
-            _slice_fraction(labels, 0.15, 0.30),
-        )
-    if variant == 5:
-        return (
-            _slice_fraction(inputs, 0.30, None),
-            _slice_fraction(labels, 0.30, None),
-            _slice_fraction(inputs, 0.15, 0.30),
-            _slice_fraction(labels, 0.15, 0.30),
-            _slice_fraction(inputs, 0.0, 0.15),
-            _slice_fraction(labels, 0.0, 0.15),
-        )
-    raise ValueError(f"Unsupported PPG-DaLiA split variant '{variant}'.")
+    segment_order = _VARIANT_SEGMENT_ORDER.get(variant)
+    if segment_order is None:
+        raise ValueError(f"Unsupported PPG-DaLiA split variant '{variant}'.")
+
+    sliced_inputs = []
+    sliced_labels = []
+    for segment_name in segment_order:
+        start_fraction, end_fraction = _SEGMENT_FRACTIONS[segment_name]
+        sliced_inputs.append(_slice_fraction(inputs, start_fraction, end_fraction))
+        sliced_labels.append(_slice_fraction(labels, start_fraction, end_fraction))
+
+    return (
+        sliced_inputs[0],
+        sliced_labels[0],
+        sliced_inputs[1],
+        sliced_labels[1],
+        sliced_inputs[2],
+        sliced_labels[2],
+    )
 
 
 def _window_inputs(inputs: np.ndarray) -> np.ndarray:
@@ -264,12 +281,16 @@ def _build_processed_cache(base_dir: Path, *, local_files_only: bool = False) ->
     )
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    train_contexts = []
-    val_contexts = []
-    test_contexts = []
-    train_targets = []
-    val_targets = []
-    test_targets = []
+    split_contexts: dict[str, list[np.ndarray]] = {
+        "train": [],
+        "val": [],
+        "test": [],
+    }
+    split_targets: dict[str, list[np.ndarray]] = {
+        "train": [],
+        "val": [],
+        "test": [],
+    }
 
     for subject_id in _SUBJECT_IDS:
         subject_payload = _load_subject_payload(inner_archive_path, subject_id)
@@ -284,33 +305,19 @@ def _build_processed_cache(base_dir: Path, *, local_files_only: bool = False) ->
             test_labels,
         ) = _split_subject_variant(inputs, labels, variant)
 
-        train_context, train_target = _paired_windows(train_inputs, train_labels)
-        val_context, val_target = _paired_windows(val_inputs, val_labels)
-        test_context, test_target = _paired_windows(test_inputs, test_labels)
+        split_inputs_labels = {
+            "train": (train_inputs, train_labels),
+            "val": (val_inputs, val_labels),
+            "test": (test_inputs, test_labels),
+        }
+        for split, (split_inputs, split_labels) in split_inputs_labels.items():
+            contexts, targets = _paired_windows(split_inputs, split_labels)
+            split_contexts[split].append(contexts)
+            split_targets[split].append(targets)
 
-        train_contexts.append(train_context)
-        val_contexts.append(val_context)
-        test_contexts.append(test_context)
-        train_targets.append(train_target)
-        val_targets.append(val_target)
-        test_targets.append(test_target)
-
-    split_arrays = {
-        "train": (
-            np.concatenate(train_contexts, axis=0),
-            np.concatenate(train_targets, axis=0),
-        ),
-        "val": (
-            np.concatenate(val_contexts, axis=0),
-            np.concatenate(val_targets, axis=0),
-        ),
-        "test": (
-            np.concatenate(test_contexts, axis=0),
-            np.concatenate(test_targets, axis=0),
-        ),
-    }
-
-    for split, (contexts, targets) in split_arrays.items():
+    for split in ("train", "val", "test"):
+        contexts = np.concatenate(split_contexts[split], axis=0)
+        targets = np.concatenate(split_targets[split], axis=0)
         contexts_path, targets_path = _processed_paths(processed_dir, split)
         np.save(contexts_path, np.asarray(contexts, dtype=np.float32))
         np.save(targets_path, np.asarray(targets, dtype=np.float32))
