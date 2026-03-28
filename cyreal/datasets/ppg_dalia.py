@@ -110,12 +110,11 @@ def _bad_zip_error(
 
 
 def _ensure_inner_archive(base_dir: Path, *, local_files_only: bool = False) -> Path:
-    raw_dir = base_dir / "raw"
-    inner_archive_path = raw_dir / "data.zip"
+    inner_archive_path = base_dir / "data.zip"
     if inner_archive_path.exists():
         return inner_archive_path
 
-    outer_archive_path = raw_dir / "ppg+dalia.zip"
+    outer_archive_path = base_dir / "ppg+dalia.zip"
     if not outer_archive_path.exists():
         if local_files_only:
             raise FileNotFoundError(
@@ -127,7 +126,7 @@ def _ensure_inner_archive(base_dir: Path, *, local_files_only: bool = False) -> 
         member_name = _find_inner_archive_member(outer_archive_path)
         ensure_zip_member_extracted(
             outer_archive_path,
-            raw_dir,
+            base_dir,
             member_name,
             target_name="data.zip",
         )
