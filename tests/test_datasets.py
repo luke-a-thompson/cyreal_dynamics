@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import gzip
+import json
 import pickle
 import struct
+import zipfile
 from pathlib import Path
 
 import jax
@@ -11,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import cyreal.datasets.ppg_dalia as ppg_dalia_module
 from cyreal.transforms import BatchTransform
 from cyreal.datasets import (
     CelebADataset,
@@ -20,6 +23,7 @@ from cyreal.datasets import (
     FashionMNISTDataset,
     KMNISTDataset,
     MNISTDataset,
+    PPGDaliaDataset,
 )
 
 
@@ -120,6 +124,49 @@ def _seed_fake_celeba(tmp_path: Path):
         for name, _, attrs, _ in samples:
             values = " ".join(str(int(v)) for v in attrs)
             f.write(f"{name} {values}\n")
+
+
+def _seed_fake_ppg_dalia_outer_archive(tmp_path: Path):
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    inner_archive_path = raw_dir / "fixture_inner.zip"
+    with zipfile.ZipFile(inner_archive_path, "w") as inner_zip:
+        for subject_id in range(1, 16):
+            time_steps = 512
+            acc_steps = time_steps // 2
+            slow_steps = time_steps // 16
+            label_steps = 80
+
+            offset = float(subject_id)
+            payload = {
+                "signal": {
+                    "wrist": {
+                        "ACC": np.stack(
+                            [
+                                np.linspace(offset, offset + 1.0, acc_steps, dtype=np.float32),
+                                np.linspace(offset + 1.0, offset + 2.0, acc_steps, dtype=np.float32),
+                                np.linspace(offset + 2.0, offset + 3.0, acc_steps, dtype=np.float32),
+                            ],
+                            axis=1,
+                        ),
+                        "BVP": np.linspace(offset, offset + 2.0, time_steps, dtype=np.float32),
+                        "EDA": np.linspace(offset, offset + 0.5, slow_steps, dtype=np.float32),
+                        "TEMP": np.linspace(offset + 0.25, offset + 0.75, slow_steps, dtype=np.float32),
+                    }
+                },
+                "label": np.linspace(offset, offset + 1.0, label_steps, dtype=np.float32),
+            }
+            inner_zip.writestr(
+                f"data/PPG_FieldStudy/S{subject_id}/S{subject_id}.pkl",
+                pickle.dumps(payload, protocol=2),
+            )
+
+    outer_archive_path = raw_dir / "ppg+dalia.zip"
+    with zipfile.ZipFile(outer_archive_path, "w") as outer_zip:
+        outer_zip.write(inner_archive_path, arcname="nested/data.zip")
+
+    inner_archive_path.unlink()
 
 
 MNIST_LIKE_DATASETS = [
@@ -302,3 +349,60 @@ def test_celeba_disk_source_streams_from_disk(tmp_path):
         np.array([1, 1, 0], dtype=np.int32),
     )
     assert np.asarray(batch["image"])[0].shape == (4, 5, 3)
+
+
+def test_ppg_dalia_dataset_processes_nested_zip_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(ppg_dalia_module, "_INPUT_WINDOW_SIZE", 64)
+    monkeypatch.setattr(ppg_dalia_module, "_INPUT_WINDOW_STEP", 16)
+    monkeypatch.setattr(ppg_dalia_module, "_OUTPUT_WINDOW_SIZE", 8)
+    monkeypatch.setattr(ppg_dalia_module, "_OUTPUT_WINDOW_STEP", 4)
+
+    _seed_fake_ppg_dalia_outer_archive(tmp_path)
+
+    dataset = PPGDaliaDataset(split="train", cache_dir=tmp_path)
+    assert len(dataset) > 0
+
+    sample = dataset[0]
+    assert sample["context"].shape == (64, 6)
+    assert sample["context"].dtype == np.float32
+    assert sample["target"].shape == (8,)
+    assert sample["target"].dtype == np.float32
+
+    raw_dir = tmp_path / "raw"
+    assert (raw_dir / "data.zip").exists()
+    assert not (raw_dir / "ppg+dalia.zip").exists()
+
+    processed_dir = tmp_path / "processed" / "v1"
+    metadata = json.loads((processed_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["variant_seed"] == 0
+    assert metadata["input_window_size"] == 64
+    assert metadata["output_window_size"] == 8
+
+
+def test_ppg_dalia_disk_source_streams_processed_arrays(tmp_path, monkeypatch):
+    monkeypatch.setattr(ppg_dalia_module, "_INPUT_WINDOW_SIZE", 64)
+    monkeypatch.setattr(ppg_dalia_module, "_INPUT_WINDOW_STEP", 16)
+    monkeypatch.setattr(ppg_dalia_module, "_OUTPUT_WINDOW_SIZE", 8)
+    monkeypatch.setattr(ppg_dalia_module, "_OUTPUT_WINDOW_STEP", 4)
+
+    _seed_fake_ppg_dalia_outer_archive(tmp_path)
+
+    dataset = PPGDaliaDataset(split="val", cache_dir=tmp_path)
+    source = PPGDaliaDataset.make_disk_source(
+        split="val",
+        cache_dir=tmp_path,
+        ordering="sequential",
+        prefetch_size=2,
+    )
+
+    batched = BatchTransform(
+        batch_size=2,
+        pad_last_batch=True,
+        element_spec_override=source.element_spec(),
+    )(source)
+
+    state = batched.init_state(jax.random.PRNGKey(0))
+    batch, mask, _ = batched.next(state)
+    np.testing.assert_array_equal(np.asarray(mask), np.array([True, True]))
+    np.testing.assert_allclose(np.asarray(batch["context"][0]), np.asarray(dataset[0]["context"]))
+    np.testing.assert_allclose(np.asarray(batch["target"][0]), np.asarray(dataset[0]["target"]))

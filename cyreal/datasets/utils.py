@@ -4,7 +4,9 @@ from __future__ import annotations
 import tarfile
 import time
 import urllib.request
+import zipfile
 from pathlib import Path
+from shutil import copyfileobj
 from typing import Optional
 
 import jax
@@ -92,6 +94,26 @@ def ensure_tar_extracted(archive: Path, extract_root: Path, target_dir: str) -> 
     extract_root.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tar:
         tar.extractall(path=extract_root)
+    return target_path
+
+
+def ensure_zip_member_extracted(
+    archive: Path,
+    extract_root: Path,
+    member_name: str,
+    *,
+    target_name: str | None = None,
+) -> Path:
+    """Extract a single file member from a zip archive if it is not already present."""
+
+    target_path = extract_root / (target_name or Path(member_name).name)
+    if target_path.exists():
+        return target_path
+
+    extract_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive, "r") as zf:
+        with zf.open(member_name, "r") as src, target_path.open("wb") as dst:
+            copyfileobj(src, dst)
     return target_path
 
 

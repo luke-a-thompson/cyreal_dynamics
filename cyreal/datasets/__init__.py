@@ -9,6 +9,7 @@ from .emnist import EMNISTDataset, EMNIST_URLS
 from .fashion_mnist import FashionMNISTDataset, FASHION_MNIST_URLS
 from .kmnist import KMNISTDataset, KMNIST_URLS
 from .mnist import MNISTDataset, MNIST_URLS
+from .ppg_dalia import PPGDaliaDataset, PPG_DALIA_URL
 from .sunspots import SunspotsDataset
 
 __all__ = [
@@ -24,5 +25,7 @@ __all__ = [
     "KMNIST_URLS",
     "MNISTDataset",
     "MNIST_URLS",
+    "PPGDaliaDataset",
+    "PPG_DALIA_URL",
     "SunspotsDataset",
 ]
