@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import gzip
-import json
 import pickle
 import struct
 import zipfile
@@ -372,11 +371,9 @@ def test_ppg_dalia_dataset_processes_nested_zip_cache(tmp_path, monkeypatch):
     assert (raw_dir / "data.zip").exists()
     assert not (raw_dir / "ppg+dalia.zip").exists()
 
-    processed_dir = tmp_path / "processed" / "v1"
-    metadata = json.loads((processed_dir / "metadata.json").read_text(encoding="utf-8"))
-    assert metadata["variant_seed"] == 0
-    assert metadata["input_window_size"] == 64
-    assert metadata["output_window_size"] == 8
+    processed_dir = tmp_path / "processed"
+    assert (processed_dir / "X_train.npy").exists()
+    assert (processed_dir / "y_train.npy").exists()
 
 
 def test_ppg_dalia_disk_source_streams_processed_arrays(tmp_path, monkeypatch):

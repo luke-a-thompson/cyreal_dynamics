@@ -1,8 +1,7 @@
-"""PPG-DaLiA dataset utilities with nested-zip caching."""
+"""PPG-DaLiA dataset utilities with a fixed cached layout."""
 
 from __future__ import annotations
 
-import json
 import pickle
 import zipfile
 from dataclasses import dataclass
@@ -14,25 +13,22 @@ import jax.numpy as jnp
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view as _sliding_window_view
 
+from ..sources import DiskSource
 from .dataset_protocol import DatasetProtocol
 from .utils import (
     download_archive,
     ensure_zip_member_extracted,
     resolve_cache_dir,
+)
+from .utils import (
     to_host_jax_array as _to_host_jax_array,
 )
-from ..sources import DiskSource
 
 PPG_DALIA_URL = "https://archive.ics.uci.edu/static/public/495/ppg+dalia.zip"
 
 _DEFAULT_CACHE_NAME = "cyreal_ppg_dalia"
-_OUTER_ARCHIVE_NAME = "ppg+dalia.zip"
-_INNER_ARCHIVE_NAME = "data.zip"
-_PROCESSING_VERSION = "v1"
-_DEFAULT_VARIANT_SEED = 0
 _SUBJECT_IDS = tuple(range(1, 16))
-_VARIANT_COUNT = 6
-_RAW_SUBJECT_PREFIX = "data/PPG_FieldStudy"
+_SUBJECT_VARIANTS = (5, 3, 3, 1, 1, 0, 0, 0, 1, 4, 3, 5, 3, 3, 5)
 
 _INPUT_WINDOW_SIZE = 49_920
 _INPUT_WINDOW_STEP = 4_992
@@ -58,7 +54,7 @@ def _as_column(array: np.ndarray) -> np.ndarray:
 
 
 def _subject_member_name(subject_id: int) -> str:
-    return f"{_RAW_SUBJECT_PREFIX}/S{subject_id}/S{subject_id}.pkl"
+    return f"data/PPG_FieldStudy/S{subject_id}/S{subject_id}.pkl"
 
 
 def _find_inner_archive_member(outer_archive_path: Path) -> str:
@@ -66,10 +62,12 @@ def _find_inner_archive_member(outer_archive_path: Path) -> str:
         candidates = [
             info.filename
             for info in zf.infolist()
-            if not info.is_dir() and Path(info.filename).name == _INNER_ARCHIVE_NAME
+            if not info.is_dir() and Path(info.filename).name == "data.zip"
         ]
     if not candidates:
-        raise FileNotFoundError(f"Could not find '{_INNER_ARCHIVE_NAME}' inside '{outer_archive_path}'.")
+        raise FileNotFoundError(
+            f"Could not find 'data.zip' inside '{outer_archive_path}'."
+        )
     if len(candidates) > 1:
         candidates.sort()
     return candidates[0]
@@ -77,18 +75,18 @@ def _find_inner_archive_member(outer_archive_path: Path) -> str:
 
 def _ensure_inner_archive(base_dir: Path) -> Path:
     raw_dir = base_dir / "raw"
-    inner_archive_path = raw_dir / _INNER_ARCHIVE_NAME
+    inner_archive_path = raw_dir / "data.zip"
     if inner_archive_path.exists():
         return inner_archive_path
 
-    outer_archive_path = raw_dir / _OUTER_ARCHIVE_NAME
+    outer_archive_path = raw_dir / "ppg+dalia.zip"
     download_archive(PPG_DALIA_URL, outer_archive_path)
     member_name = _find_inner_archive_member(outer_archive_path)
     ensure_zip_member_extracted(
         outer_archive_path,
         raw_dir,
         member_name,
-        target_name=_INNER_ARCHIVE_NAME,
+        target_name="data.zip",
     )
     if outer_archive_path.exists():
         outer_archive_path.unlink()
@@ -133,7 +131,9 @@ def _prepare_subject_arrays(subject_payload: dict) -> tuple[np.ndarray, np.ndarr
     return inputs, labels
 
 
-def _slice_fraction(array: np.ndarray, start_fraction: float, end_fraction: float | None = None) -> np.ndarray:
+def _slice_fraction(
+    array: np.ndarray, start_fraction: float, end_fraction: float | None = None
+) -> np.ndarray:
     start = int(start_fraction * len(array))
     end = len(array) if end_fraction is None else int(end_fraction * len(array))
     return array[start:end]
@@ -206,7 +206,9 @@ def _window_inputs(inputs: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"Input split length {inputs.shape[0]} is shorter than window size {_INPUT_WINDOW_SIZE}."
         )
-    windows = _sliding_window_view(inputs, _INPUT_WINDOW_SIZE, axis=0)[::_INPUT_WINDOW_STEP]
+    windows = _sliding_window_view(inputs, _INPUT_WINDOW_SIZE, axis=0)[
+        ::_INPUT_WINDOW_STEP
+    ]
     return np.asarray(np.swapaxes(windows, 1, 2), dtype=np.float32)
 
 
@@ -215,11 +217,15 @@ def _window_targets(labels: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"Target split length {labels.shape[0]} is shorter than window size {_OUTPUT_WINDOW_SIZE}."
         )
-    windows = _sliding_window_view(labels, _OUTPUT_WINDOW_SIZE, axis=0)[::_OUTPUT_WINDOW_STEP]
+    windows = _sliding_window_view(labels, _OUTPUT_WINDOW_SIZE, axis=0)[
+        ::_OUTPUT_WINDOW_STEP
+    ]
     return np.asarray(windows, dtype=np.float32)
 
 
-def _paired_windows(inputs: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _paired_windows(
+    inputs: np.ndarray, labels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     context_windows = _window_inputs(inputs)
     target_windows = _window_targets(labels)
     pair_count = min(int(context_windows.shape[0]), int(target_windows.shape[0]))
@@ -228,55 +234,26 @@ def _paired_windows(inputs: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray,
     return context_windows[:pair_count], target_windows[:pair_count]
 
 
-def _processed_paths(processed_dir: Path, split: Literal["train", "val", "test"]) -> tuple[Path, Path]:
+def _processed_paths(
+    processed_dir: Path, split: Literal["train", "val", "test"]
+) -> tuple[Path, Path]:
     return processed_dir / f"X_{split}.npy", processed_dir / f"y_{split}.npy"
 
 
 def _processed_cache_ready(processed_dir: Path) -> bool:
-    required = [processed_dir / "metadata.json"]
+    required = []
     for split in ("train", "val", "test"):
         required.extend(_processed_paths(processed_dir, split))
     return all(path.exists() for path in required)
 
 
-def _write_metadata(
-    processed_dir: Path,
-    *,
-    variant_seed: int,
-    subject_variants: dict[str, int],
-) -> None:
-    metadata = {
-        "processing_version": _PROCESSING_VERSION,
-        "variant_seed": int(variant_seed),
-        "input_window_size": _INPUT_WINDOW_SIZE,
-        "input_window_step": _INPUT_WINDOW_STEP,
-        "output_window_size": _OUTPUT_WINDOW_SIZE,
-        "output_window_step": _OUTPUT_WINDOW_STEP,
-        "subject_variants": subject_variants,
-    }
-    (processed_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-
-
-def _build_processed_cache(base_dir: Path, *, variant_seed: int = _DEFAULT_VARIANT_SEED) -> Path:
-    processed_dir = base_dir / "processed" / _PROCESSING_VERSION
+def _build_processed_cache(base_dir: Path) -> Path:
+    processed_dir = base_dir / "processed"
     if _processed_cache_ready(processed_dir):
         return processed_dir
 
     inner_archive_path = _ensure_inner_archive(base_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
-
-    rng = np.random.default_rng(variant_seed)
-    subject_variants = {
-        f"S{subject_id}": int(variant)
-        for subject_id, variant in zip(
-            _SUBJECT_IDS,
-            rng.integers(0, _VARIANT_COUNT, size=len(_SUBJECT_IDS)),
-            strict=True,
-        )
-    }
 
     train_contexts = []
     val_contexts = []
@@ -288,7 +265,7 @@ def _build_processed_cache(base_dir: Path, *, variant_seed: int = _DEFAULT_VARIA
     for subject_id in _SUBJECT_IDS:
         subject_payload = _load_subject_payload(inner_archive_path, subject_id)
         inputs, labels = _prepare_subject_arrays(subject_payload)
-        variant = subject_variants[f"S{subject_id}"]
+        variant = _SUBJECT_VARIANTS[subject_id - 1]
         (
             train_inputs,
             train_labels,
@@ -328,12 +305,6 @@ def _build_processed_cache(base_dir: Path, *, variant_seed: int = _DEFAULT_VARIA
         contexts_path, targets_path = _processed_paths(processed_dir, split)
         np.save(contexts_path, np.asarray(contexts, dtype=np.float32))
         np.save(targets_path, np.asarray(targets, dtype=np.float32))
-
-    _write_metadata(
-        processed_dir,
-        variant_seed=variant_seed,
-        subject_variants=subject_variants,
-    )
     return processed_dir
 
 
@@ -409,6 +380,3 @@ class PPGDaliaDataset(DatasetProtocol):
             ordering=ordering,
             prefetch_size=prefetch_size,
         )
-
-
-__all__ = ["PPGDaliaDataset", "PPG_DALIA_URL"]
