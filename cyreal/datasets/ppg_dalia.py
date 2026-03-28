@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pickle
 import zipfile
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -110,11 +111,12 @@ def _bad_zip_error(
 
 
 def _ensure_inner_archive(base_dir: Path, *, local_files_only: bool = False) -> Path:
-    inner_archive_path = base_dir / "data.zip"
+    raw_dir = base_dir / "raw"
+    inner_archive_path = raw_dir / "data.zip"
     if inner_archive_path.exists():
         return inner_archive_path
 
-    outer_archive_path = base_dir / "ppg+dalia.zip"
+    outer_archive_path = raw_dir / "ppg+dalia.zip"
     if not outer_archive_path.exists():
         if local_files_only:
             raise FileNotFoundError(
@@ -126,7 +128,7 @@ def _ensure_inner_archive(base_dir: Path, *, local_files_only: bool = False) -> 
         member_name = _find_inner_archive_member(outer_archive_path)
         ensure_zip_member_extracted(
             outer_archive_path,
-            base_dir,
+            raw_dir,
             member_name,
             target_name="data.zip",
         )
@@ -149,7 +151,17 @@ def _load_subject_payload(inner_archive_path: Path, subject_id: int) -> dict:
         with zipfile.ZipFile(inner_archive_path, "r") as zf:
             try:
                 with zf.open(member_name, "r") as f:
-                    return pickle.load(f, encoding="latin1")
+                    # Legacy PPG-DaLiA pickles can trigger a NumPy-visible
+                    # deprecation warning (`align=0`) during unpickling.
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=(
+                                r"dtype\(\): align should be passed as Python or NumPy "
+                                r"boolean but got `align=0`.*"
+                            ),
+                        )
+                        return pickle.load(f, encoding="latin1")
             except KeyError as exc:
                 raise FileNotFoundError(
                     f"Missing archive member '{member_name}' in '{inner_archive_path}'."
