@@ -73,14 +73,20 @@ def _find_inner_archive_member(outer_archive_path: Path) -> str:
     return candidates[0]
 
 
-def _ensure_inner_archive(base_dir: Path) -> Path:
+def _ensure_inner_archive(base_dir: Path, *, local_files_only: bool = False) -> Path:
     raw_dir = base_dir / "raw"
     inner_archive_path = raw_dir / "data.zip"
     if inner_archive_path.exists():
         return inner_archive_path
 
     outer_archive_path = raw_dir / "ppg+dalia.zip"
-    download_archive(PPG_DALIA_URL, outer_archive_path)
+    if not outer_archive_path.exists():
+        if local_files_only:
+            raise FileNotFoundError(
+                "PPG-DaLiA local_files_only=True but no local archive was found. "
+                f"Expected either '{inner_archive_path}' or '{outer_archive_path}'."
+            )
+        download_archive(PPG_DALIA_URL, outer_archive_path)
     member_name = _find_inner_archive_member(outer_archive_path)
     ensure_zip_member_extracted(
         outer_archive_path,
@@ -247,12 +253,15 @@ def _processed_cache_ready(processed_dir: Path) -> bool:
     return all(path.exists() for path in required)
 
 
-def _build_processed_cache(base_dir: Path) -> Path:
+def _build_processed_cache(base_dir: Path, *, local_files_only: bool = False) -> Path:
     processed_dir = base_dir / "processed"
     if _processed_cache_ready(processed_dir):
         return processed_dir
 
-    inner_archive_path = _ensure_inner_archive(base_dir)
+    inner_archive_path = _ensure_inner_archive(
+        base_dir,
+        local_files_only=local_files_only,
+    )
     processed_dir.mkdir(parents=True, exist_ok=True)
 
     train_contexts = []
@@ -314,10 +323,14 @@ class PPGDaliaDataset(DatasetProtocol):
 
     split: Literal["train", "val", "test"] = "train"
     cache_dir: str | Path | None = None
+    local_files_only: bool = False
 
     def __post_init__(self) -> None:
         base_dir = resolve_cache_dir(self.cache_dir, default_name=_DEFAULT_CACHE_NAME)
-        processed_dir = _build_processed_cache(base_dir)
+        processed_dir = _build_processed_cache(
+            base_dir,
+            local_files_only=self.local_files_only,
+        )
         contexts_path, targets_path = _processed_paths(processed_dir, self.split)
         self._contexts = _to_host_jax_array(np.load(contexts_path))
         self._targets = _to_host_jax_array(np.load(targets_path))
@@ -343,11 +356,15 @@ class PPGDaliaDataset(DatasetProtocol):
         *,
         split: Literal["train", "val", "test"] = "train",
         cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
         ordering: Literal["sequential", "shuffle"] = "shuffle",
         prefetch_size: int = 64,
     ) -> DiskSource:
         base_dir = resolve_cache_dir(cache_dir, default_name=_DEFAULT_CACHE_NAME)
-        processed_dir = _build_processed_cache(base_dir)
+        processed_dir = _build_processed_cache(
+            base_dir,
+            local_files_only=local_files_only,
+        )
         contexts_path, targets_path = _processed_paths(processed_dir, split)
 
         contexts_memmap = np.load(contexts_path, mmap_mode="r")
