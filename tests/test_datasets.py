@@ -157,7 +157,7 @@ def _seed_fake_ppg_dalia_outer_archive(tmp_path: Path):
                 "label": np.linspace(offset, offset + 1.0, label_steps, dtype=np.float32),
             }
             inner_zip.writestr(
-                f"data/PPG_FieldStudy/S{subject_id}/S{subject_id}.pkl",
+                f"PPG_FieldStudy/S{subject_id}/S{subject_id}.pkl",
                 pickle.dumps(payload, protocol=2),
             )
 
@@ -360,12 +360,15 @@ def test_ppg_dalia_dataset_processes_nested_zip_cache(tmp_path, monkeypatch):
 
     dataset = PPGDaliaDataset(split="train", cache_dir=tmp_path)
     assert len(dataset) > 0
+    assert dataset.multirate_spec.driver_length == 64
+    assert dataset.multirate_spec.solution_length == 8
+    assert dataset.multirate_spec.downsample_factor == 8
 
     sample = dataset[0]
-    assert sample["context"].shape == (64, 6)
-    assert sample["context"].dtype == np.float32
-    assert sample["target"].shape == (8,)
-    assert sample["target"].dtype == np.float32
+    assert sample["driver"].shape == (64, 6)
+    assert sample["driver"].dtype == np.float32
+    assert sample["solution"].shape == (8,)
+    assert sample["solution"].dtype == np.float32
 
     raw_dir = tmp_path / "raw"
     assert (raw_dir / "data.zip").exists()
@@ -374,6 +377,55 @@ def test_ppg_dalia_dataset_processes_nested_zip_cache(tmp_path, monkeypatch):
     processed_dir = tmp_path / "processed"
     assert (processed_dir / "X_train.npy").exists()
     assert (processed_dir / "y_train.npy").exists()
+
+
+def test_ppg_dalia_local_files_only_raises_when_archives_missing(tmp_path):
+    with pytest.raises(FileNotFoundError, match="local_files_only=True"):
+        PPGDaliaDataset(
+            split="train",
+            cache_dir=tmp_path,
+            local_files_only=True,
+        )
+
+
+def test_ppg_dalia_local_files_only_uses_local_outer_archive(tmp_path, monkeypatch):
+    monkeypatch.setattr(ppg_dalia_module, "_INPUT_WINDOW_SIZE", 64)
+    monkeypatch.setattr(ppg_dalia_module, "_INPUT_WINDOW_STEP", 16)
+    monkeypatch.setattr(ppg_dalia_module, "_OUTPUT_WINDOW_SIZE", 8)
+    monkeypatch.setattr(ppg_dalia_module, "_OUTPUT_WINDOW_STEP", 4)
+
+    _seed_fake_ppg_dalia_outer_archive(tmp_path)
+
+    def _download_should_not_run(_url, _path):
+        raise AssertionError("download_archive should not be called in local_files_only mode")
+
+    monkeypatch.setattr(ppg_dalia_module, "download_archive", _download_should_not_run)
+
+    dataset = PPGDaliaDataset(
+        split="train",
+        cache_dir=tmp_path,
+        local_files_only=True,
+    )
+    assert len(dataset) > 0
+
+
+def test_ppg_dalia_bad_outer_zip_reports_resolved_cache_path(tmp_path):
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    bad_archive = raw_dir / "ppg+dalia.zip"
+    bad_archive.write_bytes(b"this is not a zip")
+
+    with pytest.raises(zipfile.BadZipFile) as exc_info:
+        PPGDaliaDataset(
+            split="train",
+            cache_dir=tmp_path,
+            local_files_only=True,
+        )
+
+    msg = str(exc_info.value)
+    assert str(bad_archive.resolve()) in msg
+    assert str(tmp_path.resolve()) in msg
+    assert "local_files_only=True" in msg
 
 
 def test_ppg_dalia_disk_source_streams_processed_arrays(tmp_path, monkeypatch):
@@ -391,6 +443,9 @@ def test_ppg_dalia_disk_source_streams_processed_arrays(tmp_path, monkeypatch):
         ordering="sequential",
         prefetch_size=2,
     )
+    assert source.multirate_spec.driver_length == 64
+    assert source.multirate_spec.solution_length == 8
+    assert source.multirate_spec.downsample_factor == 8
 
     batched = BatchTransform(
         batch_size=2,
@@ -401,5 +456,7 @@ def test_ppg_dalia_disk_source_streams_processed_arrays(tmp_path, monkeypatch):
     state = batched.init_state(jax.random.PRNGKey(0))
     batch, mask, _ = batched.next(state)
     np.testing.assert_array_equal(np.asarray(mask), np.array([True, True]))
-    np.testing.assert_allclose(np.asarray(batch["context"][0]), np.asarray(dataset[0]["context"]))
-    np.testing.assert_allclose(np.asarray(batch["target"][0]), np.asarray(dataset[0]["target"]))
+    np.testing.assert_allclose(np.asarray(batch["driver"][0]), np.asarray(dataset[0]["driver"]))
+    np.testing.assert_allclose(
+        np.asarray(batch["solution"][0]), np.asarray(dataset[0]["solution"])
+    )

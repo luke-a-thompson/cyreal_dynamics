@@ -56,6 +56,30 @@ _VARIANT_SEGMENT_ORDER: dict[int, tuple[str, str, str]] = {
 }
 
 
+@dataclass(frozen=True)
+class PPGDaliaMultirateSpec:
+    """Dense-input/sparse-target contract for PPG-DaLiA windows."""
+
+    driver_length: int
+    solution_length: int
+    downsample_factor: int
+
+
+def _multirate_spec() -> PPGDaliaMultirateSpec:
+    if _OUTPUT_WINDOW_SIZE <= 0:
+        raise ValueError("_OUTPUT_WINDOW_SIZE must be positive.")
+    if _INPUT_WINDOW_SIZE % _OUTPUT_WINDOW_SIZE != 0:
+        raise ValueError(
+            "PPG-DaLiA input and target window sizes must define an integer "
+            "downsample factor."
+        )
+    return PPGDaliaMultirateSpec(
+        driver_length=_INPUT_WINDOW_SIZE,
+        solution_length=_OUTPUT_WINDOW_SIZE,
+        downsample_factor=_INPUT_WINDOW_SIZE // _OUTPUT_WINDOW_SIZE,
+    )
+
+
 def _normalize_signed(array: np.ndarray) -> np.ndarray:
     array_np = np.asarray(array, dtype=np.float32)
     min_value = float(np.min(array_np))
@@ -260,12 +284,12 @@ def _window_targets(labels: np.ndarray) -> np.ndarray:
 def _paired_windows(
     inputs: np.ndarray, labels: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    context_windows = _window_inputs(inputs)
-    target_windows = _window_targets(labels)
-    pair_count = min(int(context_windows.shape[0]), int(target_windows.shape[0]))
+    driver_windows = _window_inputs(inputs)
+    solution_windows = _window_targets(labels)
+    pair_count = min(int(driver_windows.shape[0]), int(solution_windows.shape[0]))
     if pair_count <= 0:
-        raise ValueError("PPG-DaLiA split produced no aligned context/target windows.")
-    return context_windows[:pair_count], target_windows[:pair_count]
+        raise ValueError("PPG-DaLiA split produced no paired driver/solution windows.")
+    return driver_windows[:pair_count], solution_windows[:pair_count]
 
 
 def _processed_paths(
@@ -337,7 +361,7 @@ def _build_processed_cache(base_dir: Path, *, local_files_only: bool = False) ->
 
 @dataclass
 class PPGDaliaDataset(DatasetProtocol):
-    """Processed PPG-DaLiA dataset with cached train/val/test splits."""
+    """Processed multirate PPG-DaLiA dataset with cached train/val/test splits."""
 
     split: Literal["train", "val", "test"] = "train"
     cache_dir: str | Path | None = None
@@ -350,22 +374,23 @@ class PPGDaliaDataset(DatasetProtocol):
             local_files_only=self.local_files_only,
         )
         contexts_path, targets_path = _processed_paths(processed_dir, self.split)
-        self._contexts = _to_host_jax_array(np.load(contexts_path))
-        self._targets = _to_host_jax_array(np.load(targets_path))
+        self._drivers = _to_host_jax_array(np.load(contexts_path))
+        self._solutions = _to_host_jax_array(np.load(targets_path))
+        self.multirate_spec = _multirate_spec()
 
     def __len__(self) -> int:
-        return int(self._contexts.shape[0])
+        return int(self._drivers.shape[0])
 
     def __getitem__(self, index: int):
         return {
-            "context": self._contexts[index],
-            "target": self._targets[index],
+            "driver": self._drivers[index],
+            "solution": self._solutions[index],
         }
 
     def as_array_dict(self) -> dict[str, jax.Array]:
         return {
-            "context": self._contexts,
-            "target": self._targets,
+            "driver": self._drivers,
+            "solution": self._solutions,
         }
 
     @classmethod
@@ -388,30 +413,32 @@ class PPGDaliaDataset(DatasetProtocol):
         contexts_memmap = np.load(contexts_path, mmap_mode="r")
         targets_memmap = np.load(targets_path, mmap_mode="r")
         if contexts_memmap.shape[0] != targets_memmap.shape[0]:
-            raise ValueError("PPG-DaLiA context and target counts do not match.")
+            raise ValueError("PPG-DaLiA driver and solution counts do not match.")
 
         def _read_sample(index: int | np.ndarray) -> dict[str, np.ndarray]:
             idx = int(np.asarray(index))
             return {
-                "context": np.asarray(contexts_memmap[idx], dtype=np.float32),
-                "target": np.asarray(targets_memmap[idx], dtype=np.float32),
+                "driver": np.asarray(contexts_memmap[idx], dtype=np.float32),
+                "solution": np.asarray(targets_memmap[idx], dtype=np.float32),
             }
 
         sample_spec = {
-            "context": jax.ShapeDtypeStruct(
+            "driver": jax.ShapeDtypeStruct(
                 shape=tuple(int(x) for x in contexts_memmap.shape[1:]),
                 dtype=jnp.float32,
             ),
-            "target": jax.ShapeDtypeStruct(
+            "solution": jax.ShapeDtypeStruct(
                 shape=tuple(int(x) for x in targets_memmap.shape[1:]),
                 dtype=jnp.float32,
             ),
         }
 
-        return DiskSource(
+        source = DiskSource(
             length=int(contexts_memmap.shape[0]),
             sample_fn=_read_sample,
             sample_spec=sample_spec,
             ordering=ordering,
             prefetch_size=prefetch_size,
         )
+        source.multirate_spec = _multirate_spec()
+        return source
